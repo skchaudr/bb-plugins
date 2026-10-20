@@ -430,4 +430,39 @@ describe("TraceIndexer", () => {
     ]);
     expect(indexer.listSessions({ query: "original request", limit: 10, offset: 0 }).total).toBe(0);
   });
+
+  it("indexes watcher-reported files ahead of a bounded round-robin pass", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "bb-traces-priority-"));
+    temporaryDirectories.push(directory);
+    const line = (content: string) => JSON.stringify({ type: "user/message", data: { role: "user", content } }) + "\n";
+    for (const name of ["a", "b", "c", "d", "e"]) await writeFile(join(directory, name + ".jsonl"), line(name), "utf8");
+    const database = new Database(":memory:");
+    databases.push(database);
+    const indexer = new TraceIndexer(database, ensureSchema(database));
+    const root: RootSpec = { id: "fixture-priority", source: "custom", label: "Fixture", path: directory, kind: "session", format: "jsonl" };
+    await indexer.scan([root]);
+    const lines = (path: string) =>
+      (database.prepare("SELECT indexed_lines FROM trace_files WHERE path = ?").get(path) as { indexed_lines: number } | undefined)?.indexed_lines;
+
+    const live = join(directory, "e.jsonl");
+    const child = join(directory, "e", "subagents", "agent-1.jsonl");
+    const ignored = join(directory, "node_modules", "x.jsonl");
+    await appendFile(live, line("live append"), "utf8");
+    await mkdir(join(directory, "e", "subagents"), { recursive: true });
+    await writeFile(child, line("child"), "utf8");
+    await mkdir(join(directory, "node_modules"), { recursive: true });
+    await writeFile(ignored, line("ignored"), "utf8");
+
+    const result = await indexer.scan([root], undefined, {
+      maxFiles: 1,
+      forceFingerprintPaths: new Set([live, child, ignored, join(directory, "gone.jsonl"), "/elsewhere/x.jsonl"]),
+    });
+
+    expect(result.changed).toBe(true);
+    expect(lines(live)).toBe(2);
+    expect(lines(child)).toBe(1);
+    expect(lines(ignored)).toBeUndefined();
+    expect(result.processedPaths).toEqual(expect.arrayContaining([live, child, join(directory, "gone.jsonl")]));
+    expect(result.processedPaths).not.toContain(ignored);
+  });
 });

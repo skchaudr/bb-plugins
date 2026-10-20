@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { createReadStream, existsSync } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, join, relative, resolve, sep } from "node:path";
 import { spawn } from "node:child_process";
 
 export type TraceSourceId = "codex" | "claude" | "pi" | "omp" | "dsh" | "custom";
@@ -518,6 +518,28 @@ export function defaultSessionRoots(home = homedir()): RootSpec[] {
   ];
 }
 
+// Live sessions: files the watcher reports are indexed ahead of the round-robin
+// pass, bounded per scan so a burst of writes cannot starve the pass.
+const PRIORITY_SCAN_FILES = 16;
+
+function isSessionFileName(name: string): boolean {
+  const lower = name.toLowerCase();
+  return lower.endsWith(".jsonl") || lower.endsWith(".jsonl.zst") || lower.endsWith(".jsonl.zstd");
+}
+
+export function priorityRootFor(roots: RootSpec[], filePath: string): RootSpec | null {
+  if (!isSessionFileName(basename(filePath))) return null;
+  for (const root of roots) {
+    if (root.kind !== "session") continue;
+    const rel = relative(root.path, filePath);
+    if (!rel || rel.startsWith("..") || resolve(root.path, rel) !== filePath) continue;
+    const dirs = rel.split(sep).slice(0, -1);
+    if (dirs.length > MAX_SESSION_DEPTH || dirs.some((name) => IGNORED_DIRECTORY_NAMES.has(name))) continue;
+    return root;
+  }
+  return null;
+}
+
 async function walkFiles(root: string, signal?: AbortSignal): Promise<DiscoveryResult> {
   const output: string[] = [];
   let accessible = true;
@@ -892,6 +914,31 @@ export class TraceIndexer {
     let complete = true;
     for (const root of roots) this.ensureRoot(root);
     this.pruneInactiveRoots(roots);
+
+    let priorityBudget = PRIORITY_SCAN_FILES;
+    for (const filePath of options.forceFingerprintPaths ?? []) {
+      if (priorityBudget <= 0) break;
+      if (signal?.aborted) return result(false);
+      const root = priorityRootFor(roots, filePath);
+      if (!root) continue;
+      priorityBudget -= 1;
+      try {
+        await stat(filePath);
+      } catch {
+        // Deleted or renamed away: the full pass reconciles removals.
+        processedPaths.push(filePath);
+        continue;
+      }
+      try {
+        changed = (await this.indexSessionFile(root, filePath, signal, true)) || changed;
+        if (signal?.aborted) return result(false);
+        processedPaths.push(filePath);
+      } catch (error) {
+        if (signal?.aborted) return result(false);
+        options.failedSessionPaths?.add(filePath);
+        this.log("Could not index " + filePath + ": " + (error instanceof Error ? error.message : String(error)));
+      }
+    }
 
     for (const root of roots) {
       if (signal?.aborted) return result(false);
